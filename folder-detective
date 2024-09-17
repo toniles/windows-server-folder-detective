@@ -1,84 +1,150 @@
-$Path = "C:\"
-$FolderCount = 10
+# Función para validar y obtener una ruta de archivo CSV válida
+function Get-ValidCSVPath {
+    do {
+        $csvPath = Read-Host "Introduce la ruta completa donde quieres guardar el archivo CSV (incluyendo el nombre del archivo, por ejemplo, [C:\Ruta\Al\Archivo.csv])"
 
-function Get-FolderSizeWithTimeout {
-    param (
-        [string]$FolderPath,
-        [int]$TimeoutSeconds
-    )
-    $job = Start-Job -ScriptBlock {
-        param ($Path)
-        (Get-ChildItem -Path $Path -File -Force -ErrorAction SilentlyContinue | 
-         Measure-Object -Property Length -Sum).Sum
-    } -ArgumentList $FolderPath
+        # Remover corchetes si el usuario los incluyó
+        $csvPath = $csvPath -replace '^\[|\]$', ''
 
-    $result = $job | Wait-Job -Timeout $TimeoutSeconds | Receive-Job
-    Remove-Job -Job $job -Force
-    return $result
+        # Verificar si la ruta incluye un nombre de archivo
+        if (-not ($csvPath -match '\.csv$')) {
+            Write-Host "Por favor, incluye un nombre de archivo con extensión .csv" -ForegroundColor Yellow
+            continue
+        }
+
+        # Verificar si el directorio existe
+        $directory = Split-Path -Parent $csvPath
+        if (-not (Test-Path $directory)) {
+            $createDir = Read-Host "El directorio no existe. ¿Quieres crearlo? (S/N)"
+            if ($createDir -eq 'S') {
+                try {
+                    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+                } catch {
+                    Write-Host "No se pudo crear el directorio: $_" -ForegroundColor Red
+                    continue
+                }
+            } else {
+                continue
+            }
+        }
+
+        # Intentar crear un archivo de prueba para verificar permisos
+        try {
+            [System.IO.File]::Create($csvPath).Close()
+            Remove-Item -Path $csvPath -Force
+            return $csvPath
+        } catch {
+            Write-Host "No tienes permisos para escribir en esta ubicación. Por favor, elige otra ruta." -ForegroundColor Red
+        }
+    } while ($true)
 }
 
-function Format-Size {
-    param ([long]$Size)
-    if ($Size -ge 1GB) {
-        return "{0:N2} GB" -f ($Size / 1GB)
-    } elseif ($Size -ge 1MB) {
-        return "{0:N2} MB" -f ($Size / 1MB)
-    } else {
-        return "{0:N2} KB" -f ($Size / 1KB)
+$csvPath = Get-ValidCSVPath
+
+$Path = "C:\"
+
+# Verificar si el script se está ejecutando como administrador
+if (-not ([bool]([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))) {
+    Write-Host "Este script requiere permisos de administrador. Por favor, ejecútalo como administrador." -ForegroundColor Red
+    exit
+}
+
+# Función para obtener el tamaño de la carpeta usando Get-ChildItem
+function Get-FolderSize {
+    param([string]$Path)
+    try {
+        $size = (Get-ChildItem -Path $Path -Recurse -Force -ErrorAction SilentlyContinue |
+                 Where-Object { -not $_.PSIsContainer } |
+                 Measure-Object -Property Length -Sum).Sum
+        return $size
+    } catch {
+        Write-Host "Error al procesar $Path : $_" -ForegroundColor Yellow
+        return $null
     }
 }
 
-Write-Host "Calculating dynamic timeout..."
-$fastFolders = Get-ChildItem -Path $Path -Directory |
-    Select-Object -First 50 |
-    ForEach-Object {
-        $startTime = Get-Date
-        $size = Get-FolderSizeWithTimeout -FolderPath $_.FullName -TimeoutSeconds 3
-        $elapsedTime = (Get-Date) - $startTime
-        if ($null -ne $size) {
-            [PSCustomObject]@{
-                ElapsedTime = $elapsedTime.TotalSeconds
-                Size = $size
-            }
+# Definir carpetas excluidas
+$excludedFolders = @(
+    [System.IO.Path]::GetFullPath("$env:SystemRoot"),
+    [System.IO.Path]::GetFullPath("$env:ProgramFiles"),
+    [System.IO.Path]::GetFullPath("$env:ProgramFiles(x86)"),
+    [System.IO.Path]::GetFullPath("$env:ProgramData"),
+    [System.IO.Path]::GetFullPath("$env:UserProfile\AppData"),
+    [System.IO.Path]::GetFullPath("$env:WinDir")
+)
+
+# Obtener todas las carpetas excluyendo las carpetas del sistema
+Write-Host "Obteniendo la lista de carpetas..."
+$allFolders = Get-ChildItem -Path $Path -Directory -Force -ErrorAction SilentlyContinue | Where-Object {
+    $folderPath = [System.IO.Path]::GetFullPath($_.FullName)
+    $isExcluded = $false
+    foreach ($excludedFolder in $excludedFolders) {
+        if ($folderPath.StartsWith($excludedFolder, [StringComparison]::InvariantCultureIgnoreCase)) {
+            $isExcluded = $true
+            break
         }
-    } | 
-    Sort-Object ElapsedTime |
-    Select-Object -First $FolderCount
+    }
+    -not $isExcluded
+}
 
-$averageTime = ($fastFolders | Measure-Object -Property ElapsedTime -Average).Average
-$TimeoutSeconds = [math]::Max(5, [math]::Round($averageTime * 3, 0))
-Write-Host "Dynamic timeout calculated: $TimeoutSeconds seconds"
+$totalFolders = $allFolders.Count
+Write-Host "Total de carpetas a analizar: $totalFolders"
 
-$largeFolders = @()
 $foldersAnalyzed = 0
-$totalFolders = (Get-ChildItem -Path $Path -Directory -Recurse -Force -ErrorAction SilentlyContinue).Count
-Write-Host "Total folders to analyze: $totalFolders"
+$progressActivity = "Analizando carpetas"
 
-Get-ChildItem -Path $Path -Directory -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+$results = @()
+
+foreach ($folder in $allFolders) {
     $foldersAnalyzed++
-    $folderPath = $_.FullName
-    Write-Host "`rAnalyzing: $folderPath" -NoNewline
+    $folderPath = [System.IO.Path]::GetFullPath($folder.FullName)
 
-    $size = Get-FolderSizeWithTimeout -FolderPath $folderPath -TimeoutSeconds $TimeoutSeconds
-    
-    if ($null -ne $size -and $size -ge 1GB) {
-        $largeFolders += [PSCustomObject]@{
+    # Actualizar barra de progreso
+    $percentComplete = [math]::Round(($foldersAnalyzed / $totalFolders) * 100, 2)
+    Write-Progress -Activity $progressActivity -Status "Procesando $foldersAnalyzed / $totalFolders ($percentComplete%)" -PercentComplete $percentComplete
+
+    # Obtener tamaño usando Get-ChildItem
+    $size = Get-FolderSize -Path $folderPath
+
+    if ($null -ne $size -and $size -gt 0) {
+        $largeFolder = [PSCustomObject]@{
             Path = $folderPath
             Size = $size
         }
-        
-        Write-Host "`rLarge folder found: $folderPath - $(Format-Size $size)" -ForegroundColor Green
-    }
-    
-    if ($foldersAnalyzed % 100 -eq 0 -or $foldersAnalyzed -eq $totalFolders) {
-        $percentComplete = [math]::Round(($foldersAnalyzed / $totalFolders) * 100, 2)
-        Write-Host "`rProgress: $foldersAnalyzed / $totalFolders ($percentComplete%)" -NoNewline
+        $results += $largeFolder
+
+        if ($size -ge 1GB) {
+            Write-Host "Carpeta grande encontrada: $folderPath - $($size / 1GB) GB" -ForegroundColor Green
+        }
     }
 }
 
-Write-Host "`nAnalysis completed. Total folders analyzed: $foldersAnalyzed"
+Write-Progress -Activity $progressActivity -Completed
+Write-Host "`nAnálisis completado. Total de carpetas analizadas: $foldersAnalyzed"
 
-$largeFolders | 
+# Guardar resultados en CSV
+try {
+    $results | Sort-Object Size -Descending | ForEach-Object {
+        [PSCustomObject]@{
+            'Path' = $_.Path
+            'Size' = $_.Size.ToString()
+        }
+    } | Export-Csv -Path $csvPath -NoTypeInformation -Force -Encoding UTF8
+
+    Write-Host "Resultados guardados en [$csvPath]" -ForegroundColor Green
+} catch {
+    Write-Host "Error al guardar el archivo CSV: $_" -ForegroundColor Red
+}
+
+# Mostrar los 10 primeros resultados
+Write-Host "`nLos 10 primeros resultados:"
+$results | 
     Sort-Object Size -Descending | 
-    Select-Object @{N='Path';E={$_.Path}}, @{N='Size';E={Format-Size $_.Size}} | 
+    Select-Object -First 10 | 
+    ForEach-Object {
+        [PSCustomObject]@{
+            'Path' = $_.Path
+            'Size' = [math]::Round($_.Size / 1GB, 2)
+        }
+    } | 
     Format-Table -AutoSize

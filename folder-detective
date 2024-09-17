@@ -1,0 +1,84 @@
+$Path = "C:\"
+$FolderCount = 10
+
+function Get-FolderSizeWithTimeout {
+    param (
+        [string]$FolderPath,
+        [int]$TimeoutSeconds
+    )
+    $job = Start-Job -ScriptBlock {
+        param ($Path)
+        (Get-ChildItem -Path $Path -File -Force -ErrorAction SilentlyContinue | 
+         Measure-Object -Property Length -Sum).Sum
+    } -ArgumentList $FolderPath
+
+    $result = $job | Wait-Job -Timeout $TimeoutSeconds | Receive-Job
+    Remove-Job -Job $job -Force
+    return $result
+}
+
+function Format-Size {
+    param ([long]$Size)
+    if ($Size -ge 1GB) {
+        return "{0:N2} GB" -f ($Size / 1GB)
+    } elseif ($Size -ge 1MB) {
+        return "{0:N2} MB" -f ($Size / 1MB)
+    } else {
+        return "{0:N2} KB" -f ($Size / 1KB)
+    }
+}
+
+Write-Host "Calculating dynamic timeout..."
+$fastFolders = Get-ChildItem -Path $Path -Directory |
+    Select-Object -First 50 |
+    ForEach-Object {
+        $startTime = Get-Date
+        $size = Get-FolderSizeWithTimeout -FolderPath $_.FullName -TimeoutSeconds 3
+        $elapsedTime = (Get-Date) - $startTime
+        if ($null -ne $size) {
+            [PSCustomObject]@{
+                ElapsedTime = $elapsedTime.TotalSeconds
+                Size = $size
+            }
+        }
+    } | 
+    Sort-Object ElapsedTime |
+    Select-Object -First $FolderCount
+
+$averageTime = ($fastFolders | Measure-Object -Property ElapsedTime -Average).Average
+$TimeoutSeconds = [math]::Max(5, [math]::Round($averageTime * 3, 0))
+Write-Host "Dynamic timeout calculated: $TimeoutSeconds seconds"
+
+$largeFolders = @()
+$foldersAnalyzed = 0
+$totalFolders = (Get-ChildItem -Path $Path -Directory -Recurse -Force -ErrorAction SilentlyContinue).Count
+Write-Host "Total folders to analyze: $totalFolders"
+
+Get-ChildItem -Path $Path -Directory -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+    $foldersAnalyzed++
+    $folderPath = $_.FullName
+    Write-Host "`rAnalyzing: $folderPath" -NoNewline
+
+    $size = Get-FolderSizeWithTimeout -FolderPath $folderPath -TimeoutSeconds $TimeoutSeconds
+    
+    if ($null -ne $size -and $size -ge 1GB) {
+        $largeFolders += [PSCustomObject]@{
+            Path = $folderPath
+            Size = $size
+        }
+        
+        Write-Host "`rLarge folder found: $folderPath - $(Format-Size $size)" -ForegroundColor Green
+    }
+    
+    if ($foldersAnalyzed % 100 -eq 0 -or $foldersAnalyzed -eq $totalFolders) {
+        $percentComplete = [math]::Round(($foldersAnalyzed / $totalFolders) * 100, 2)
+        Write-Host "`rProgress: $foldersAnalyzed / $totalFolders ($percentComplete%)" -NoNewline
+    }
+}
+
+Write-Host "`nAnalysis completed. Total folders analyzed: $foldersAnalyzed"
+
+$largeFolders | 
+    Sort-Object Size -Descending | 
+    Select-Object @{N='Path';E={$_.Path}}, @{N='Size';E={Format-Size $_.Size}} | 
+    Format-Table -AutoSize

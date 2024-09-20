@@ -1,4 +1,4 @@
-# Windows Folder Detective 🕵️‍♂️
+# Windows Server Folder Detective 🕵️‍♂️
 
 [![PowerShell 7](https://img.shields.io/badge/PowerShell-7+-blue.svg)](https://github.com/PowerShell/PowerShell)
 [![License: Unlicense](https://img.shields.io/badge/License-Unlicense-green.svg)](https://unlicense.org/)
